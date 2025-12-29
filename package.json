@@ -3,9 +3,12 @@
     "version": "1.4.8",
     "description": "WorkAdventure Map Optimizer! Does your map need a diet?",
     "main": "./dist/index.js",
-    "repository": "https://github.com/nolway/wa-map-optimizer",
     "author": "Nolway (Alexis Faizeau)",
     "license": "AGPL-3.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/nolway/wa-map-optimizer-vite"
+    },
     "types": "dist/index.d.ts",
     "files": [
         "/dist"
