@@ -1,6 +1,6 @@
 {
     "name": "wa-map-optimizer",
-    "version": "1.4.8",
+    "version": "1.5.0",
     "description": "WorkAdventure Map Optimizer! Does your map need a diet?",
     "main": "./dist/index.js",
     "author": "Nolway (Alexis Faizeau)",

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/nolway/wa-map-optimizer/compare/v1.4.8...v1.5.0) (2025-12-30)
+
+
+### Features
+
+* use OIDC npm connection ([3b101e0](https://github.com/nolway/wa-map-optimizer/commit/3b101e0614b9ecf96c5277c801a49c285c4e9f37))
+
 ## [1.4.8](https://github.com/Nolway/wa-map-optimizer/compare/v1.4.7...v1.4.8) (2024-06-19)
 
 
