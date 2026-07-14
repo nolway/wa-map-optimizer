@@ -59,8 +59,10 @@ function unionSize(a: ReadonlySet<number>, b: ReadonlySet<number>): number {
  *
  * Cost of a cluster = power-of-2 padded slot count + `fixedCost` (a per-tileset overhead standing
  * for the extra HTTP request / texture bind, which pushes small disjoint layers to share a
- * tileset). Since padding never grows when merging, clusters merge until the capacity is reached,
- * high-overlap pairs first — which is what minimizes tile duplication across tilesets.
+ * tileset). A merge happens only while it lowers the total cost: high-overlap pairs merge first
+ * (their shared tiles are counted once instead of twice), and a merge that would cross a
+ * power-of-2 boundary — doubling a texture mostly to hold padding — is declined. Merging stops at
+ * the capacity or when no pair pays off, whichever comes first.
  *
  * Layers with no tiles are skipped, layers bigger than `capacity` get their own cluster flagged
  * `oversized`. Output is deterministic: clusters and their members are ordered by layer index.

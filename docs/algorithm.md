@@ -89,16 +89,23 @@ to share a tileset instead of each getting a tiny one.
 3. Merge the pair with the highest savings, provided the union still fits the capacity.
 4. Repeat until no merge with positive savings exists.
 
-Two properties make this simple greedy work well:
+Two forces shape the result:
 
-- Because `slots(a+b) ≤ slots(a) + slots(b)`, merging never increases the padded area. With
-  `F > 0`, *any* feasible merge has positive savings — so clusters keep merging until they hit the
-  capacity ceiling. On a map whose tiles all fit in one texture, the result is a single tileset
-  shared by every layer: zero duplication, one download.
-- When the map does *not* fit in one texture, the order of merges matters — and the greedy handles
-  it: pairs sharing many tiles have much larger savings (the shared tiles are counted once instead
-  of twice), so overlapping layers merge first. Layers end up split along low-overlap boundaries,
-  which is exactly what minimizes duplication.
+- **The fixed cost `F` drives consolidation.** When merging does not grow the padded area (the
+  union fits in the slots the two clusters already occupy together), the merge saves one texture
+  essentially for free, so small and overlapping layers coalesce. On a typical map whose tiles all
+  fit in one texture, everything collapses into a single tileset shared by every layer: zero
+  duplication, one download.
+- **The power-of-2 padding vetoes wasteful merges.** Padded area *can* grow when a merge crosses a
+  power-of-2 boundary: adding a 1 024-tile cluster to an exactly-full 8 192-tile cluster would
+  jump the texture from 8 192 to 16 384 slots — 7 168 slots of pure padding just to save one file
+  — so those clusters stay separate. Merges only happen while they reduce
+  `total padded area + F × number of textures`.
+
+When the map does *not* fit in one texture, the order of merges matters — and the greedy handles
+it: pairs sharing many tiles have much larger savings (the shared tiles are counted once instead
+of twice), so overlapping layers merge first. Layers end up split along low-overlap boundaries,
+which is exactly what minimizes duplication.
 
 **Oversized layers.** If a *single layer* alone uses more tiles than the capacity, no clustering
 can help. The layer is never split into two layers (that would break scripts referencing layers by
