@@ -50,6 +50,8 @@ async function run() {
           tileset: {
             prefix: "optimized",
             suffix: "tileset",
+            // Maximum size (in pixels) of an output tileset texture.
+            // Must be a power of 2. Default: 4096.
             size: 1024,
           }
       }
@@ -65,12 +67,33 @@ run();
 This package will optimize your Tiled map by removing unused tiles and creating a new tileset 
 with only the used tiles. It will also update the map to use the new tileset.
 
-At a high level, the optimizer walks every tile layer of the map (recursing into group layers),
-collects the set of tiles that are actually referenced, extracts only those tiles from the source
-tilesets and re-packs them into new, tightly-packed tileset images. The map data is then rewritten
-in place so every tile reference points to its new location, and the source tilesets are discarded.
+A detailed, step-by-step description of the algorithm is available in
+[docs/algorithm.md](docs/algorithm.md).
+
+At a high level, the optimizer works in three passes:
+
+1. **Analysis**: walk every tile layer of the map (recursing into group layers) and collect the set
+   of tiles each layer actually references.
+2. **Clustering**: group layers so that each group's tiles fit together in a single tileset texture.
+3. **Rendering**: extract the tiles from the source tilesets, re-pack them into one new tileset
+   image per group, and rewrite the map data so every tile reference points to its new location.
+   The source tilesets are discarded.
 
 Rules:
+
+- **Each layer references a single tileset.** This is the requirement for Phaser 4's
+  `TilemapGPULayer`: a GPU-rendered layer must source all of its tiles from one tileset. The
+  optimizer guarantees it by construction — layers are clustered, and each cluster produces exactly
+  one tileset holding the union of its layers' tiles. A tileset may be shared by several layers,
+  and a tile used by layers living in different clusters is duplicated into both tilesets (the
+  clustering minimizes how often this happens).
+- **Tileset textures have power-of-2 dimensions.** Output images are rectangular power-of-2
+  textures (e.g. 2048x1024), as close to square as possible, capped at a configurable maximum size
+  (`output.tileset.size`, default `4096`). The clustering packs as many layers as possible into
+  each texture within that cap.
+- **A single layer bigger than one tileset is never split.** If one layer alone uses more tiles
+  than fit in the maximum texture size, the optimizer warns and renders that layer with several
+  tilesets: the map stays correct, but that layer will not be eligible for GPU rendering.
 
 - **Only referenced tiles are kept.** Tiles that are never placed on any tile layer are dropped
   from the output. Empty tiles (id `0`) are ignored.
@@ -82,16 +105,12 @@ Rules:
   the new id.
 - **Animated tiles are kept whole.** When a tile is animated, all of its animation frames are pulled
   into the output (even frames that are never placed directly on the map), and the whole animation is
-  guaranteed to stay within a single tileset — the current tileset is flushed early rather than
-  splitting an animation across two of them. Frame references are rewritten to the new local ids.
+  guaranteed to stay within the same tileset as its base tile (frame ids are tileset-local in the
+  Tiled format). Frame references are rewritten to the new local ids.
 - **Named tiles are always kept.** Tiles carrying a `name` property are included in the new tileset
   even if they are not used anywhere on the map (WorkAdventure may reference them by name at runtime).
 - **Tile and tileset properties are preserved.** Per-tile properties and tileset-level properties are
   carried over onto the corresponding tiles in the new tilesets.
-- **Output is split into fixed-size "chunk" tilesets.** New tiles are packed into square tileset
-  images capped at a configurable size (default `512px`, i.e. up to 16×16 = 256 tiles per chunk).
-  Once a chunk is full a new one is started, and each rendered image is sized to the smallest square
-  grid that fits its tiles.
 - **Tileset images can optionally be compressed** with pngquant (via the `output.tileset.compress`
   option) to further shrink the output.
 
