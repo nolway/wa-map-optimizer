@@ -351,7 +351,12 @@ export class Optimizer {
             }
 
             sharpComposites.push({
-                input: tileBuffer,
+                input: tileBuffer.buffer,
+                raw: {
+                    width: this.tileSize,
+                    height: this.tileSize,
+                    channels: tileBuffer.channels,
+                },
                 top: y,
                 left: x,
             });
@@ -375,7 +380,10 @@ export class Optimizer {
         return await newFile.pack().pipe(sharp()).toBuffer();
     }
 
-    private async extractTile(tileset: ITiledMapEmbeddedTileset, gid: number): Promise<Buffer> {
+    private async extractTile(
+        tileset: ITiledMapEmbeddedTileset,
+        gid: number
+    ): Promise<{ buffer: Buffer; channels: 1 | 2 | 3 | 4 }> {
         if (!tileset.imagewidth) {
             throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
         }
@@ -398,14 +406,20 @@ export class Optimizer {
             throw new Error("Undefined sharp object");
         }
 
-        return await sharpObject
+        // Return raw (already-decoded) pixels instead of a PNG. The source is held in memory as a
+        // raw buffer, so encoding each 32x32 tile to PNG here only to have composite() decode it
+        // again is pure overhead. Raw buffers let composite() blend them directly.
+        const { data, info } = await sharpObject
             .extract({
                 left: left,
                 top: top,
                 width: this.tileSize,
                 height: this.tileSize,
             })
-            .toBuffer();
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+
+        return { buffer: data, channels: info.channels };
     }
 
     /**
