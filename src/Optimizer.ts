@@ -6,23 +6,38 @@ import {
 } from "@workadventure/tiled-map-type-guard";
 import { PNG } from "pngjs";
 import sharp, { Sharp } from "sharp";
+import { Cluster, clusterLayers, slotsFor } from "./Clustering.js";
+import {
+    animationGroup,
+    applyFlipBits,
+    collectLayerTileSets,
+    collectUnusedNamedTiles,
+    stripFlipBits,
+    TilesetIndex,
+} from "./LayerAnalysis.js";
 import { LogLevel, OptimizeBufferOptions } from "./guards/libGuards.js";
 
 sharp.cache(false);
 
+/**
+ * Per-tileset overhead used by the clustering cost function, in tile slots. It stands for the cost
+ * of one more HTTP request / GPU texture, and pushes small disjoint layers to share a tileset.
+ */
+const TILESET_FIXED_COST = 64;
+
+/**
+ * The optimizer guarantees that each tile layer references tiles from a single output tileset
+ * (Phaser 4 TilemapGPULayer requirement), by clustering layers and rendering one tileset per
+ * cluster. It works in three passes:
+ * 1. Analysis: collect the set of tiles used by each layer (animation closures included).
+ * 2. Clustering: group layers so that each group's tile union fits in one power-of-2 texture.
+ * 3. Rendering: draw one tileset image per cluster and remap every layer's tile ids.
+ */
 export class Optimizer {
     private optimizedMap: ITiledMap;
-    /**
-     * A map mapping the old tile id to the new tile id (global) and to the new tile id in the current tileset
-     * @private
-     */
-    private optimizedTiles: Map<number, { global: number; local: number }>;
-    private optimizedTilesets: ITiledMapEmbeddedTileset[];
-    private currentTilesetOptimization: ITiledMapEmbeddedTileset;
-    private currentExtractedTiles: Promise<Buffer>[];
     private tileSize: number;
-    private outputSize: number;
-    private tilesetMaxTileCount: number;
+    private maxTextureSize: number;
+    private tilesetCapacity: number;
     private tilesetPrefix: string;
     private tilesetSuffix?: string;
     private logLevel: LogLevel;
@@ -34,18 +49,26 @@ export class Optimizer {
         private readonly outputPath: string
     ) {
         this.optimizedMap = map;
-        this.optimizedTiles = new Map<number, { global: number; local: number }>();
-        this.optimizedTilesets = [];
         this.tileSize = options?.tile?.size ?? 32;
-        this.outputSize = options?.output?.tileset?.size ? options?.output?.tileset?.size : 512;
-        const maxColumns = this.outputSize / 32;
-        this.tilesetMaxTileCount = maxColumns * maxColumns;
+        this.maxTextureSize = options?.output?.tileset?.size ?? 4096;
         this.tilesetPrefix = options?.output?.tileset?.prefix ?? "chunk";
         this.tilesetSuffix = options?.output?.tileset?.suffix;
         this.logLevel = options?.logs ?? LogLevel.NORMAL;
 
-        this.currentTilesetOptimization = this.generateNextTileset();
-        this.currentExtractedTiles = [];
+        if (this.maxTextureSize < this.tileSize) {
+            throw new Error(
+                `Max tileset size (${this.maxTextureSize}) cannot be smaller than the tile size (${this.tileSize})`
+            );
+        }
+
+        const maxColumns = Math.floor(this.maxTextureSize / this.tileSize);
+        this.tilesetCapacity = maxColumns * maxColumns;
+
+        if (this.logLevel && (this.tileSize & (this.tileSize - 1)) !== 0) {
+            console.warn(
+                `Tile size ${this.tileSize} is not a power of 2: output tileset images will not have power-of-2 dimensions`
+            );
+        }
 
         for (const tileset of [...tilesetsBuffers.keys()]) {
             if (tileset.tileheight !== this.tileSize || tileset.tilewidth !== this.tileSize) {
@@ -59,383 +82,270 @@ export class Optimizer {
             console.log("Start tiles optimization...");
         }
 
-        await this.optimizeLayers(this.optimizedMap.layers);
+        const sourceTilesets = [...this.tilesetsBuffers.keys()];
+        const tilesetIndex = new TilesetIndex(sourceTilesets);
 
-        await this.optimizeNamedTiles();
-
-        if (this.currentExtractedTiles.length > 0) {
-            await this.currentTilesetRendering();
-        }
-
-        this.optimizedMap.tilesets = [];
-
-        for (const currentTileset of this.optimizedTilesets) {
-            this.optimizedMap.tilesets.push(currentTileset);
-        }
+        // Pass 1: analysis
+        const { layerTileSets, unknownGids } = collectLayerTileSets(this.optimizedMap.layers, tilesetIndex);
 
         if (this.logLevel) {
-            console.log("Tiles optimization has been done");
+            for (const gid of unknownGids) {
+                console.error(`${gid} undefined! Corrupted layers or undefined in tilesets`);
+                console.error("This tile has been replaced by an empty tile");
+            }
+        }
+
+        const usedTiles = new Set<number>();
+        for (const layerTileSet of layerTileSets) {
+            for (const gid of layerTileSet.tiles) {
+                usedTiles.add(gid);
+            }
+        }
+
+        const namedTiles = collectUnusedNamedTiles(sourceTilesets, tilesetIndex, usedTiles);
+        if (namedTiles.size > 0) {
+            layerTileSets.push({ name: "<named tiles>", tiles: namedTiles });
+            for (const gid of namedTiles) {
+                usedTiles.add(gid);
+            }
+        }
+
+        // Pass 2: clustering
+        const clusters = clusterLayers(
+            layerTileSets.map((layerTileSet, index) => ({
+                index: index,
+                name: layerTileSet.name,
+                tiles: layerTileSet.tiles,
+            })),
+            this.tilesetCapacity,
+            TILESET_FIXED_COST
+        );
+
+        for (const cluster of clusters) {
+            if (cluster.oversized && this.logLevel) {
+                console.warn(
+                    `Layer "${cluster.members[0].name}" uses ${cluster.tiles.size} tiles, more than the ${this.tilesetCapacity} fitting in a single ${this.maxTextureSize}x${this.maxTextureSize} tileset.`
+                );
+                console.warn(
+                    "It will be split across several tilesets and will NOT be eligible for GPU rendering. Consider raising output.tileset.size or simplifying the layer."
+                );
+            }
+        }
+
+        // Pass 3: rendering & remapping
+        const layerMappings = new Map<ITiledMapLayer, Map<number, number>>();
+        const newTilesets: ITiledMapEmbeddedTileset[] = [];
+        let firstgid = 1;
+        let renderedTileCount = 0;
+
+        for (const cluster of clusters) {
+            const chunks = this.splitIntoChunks(cluster, tilesetIndex);
+            const clusterMapping = new Map<number, number>();
+
+            for (const gids of chunks) {
+                const localIds = new Map<number, number>();
+
+                for (const [localId, gid] of gids.entries()) {
+                    localIds.set(gid, localId);
+                    clusterMapping.set(gid, firstgid + localId);
+                }
+
+                const tileset = this.buildTilesetData(gids, localIds, firstgid, newTilesets.length + 1, tilesetIndex);
+                await this.renderTileset(gids, tileset, tilesetIndex);
+                newTilesets.push(tileset);
+
+                if (this.logLevel) {
+                    const layerNames = cluster.members.map((member) => member.name).join(", ");
+                    console.log(
+                        `${tileset.name}: ${tileset.imagewidth ?? 0}x${tileset.imageheight ?? 0}px, ${
+                            gids.length
+                        } tiles — layers: ${layerNames}`
+                    );
+                }
+
+                // Advance by the full image-grid capacity so the reserved GID range matches the
+                // image dimensions Phaser reads. renderedTileCount still counts real tiles.
+                firstgid += slotsFor(gids.length);
+                renderedTileCount += gids.length;
+            }
+
+            for (const member of cluster.members) {
+                const layer = layerTileSets[member.index].layer;
+                if (layer) {
+                    layerMappings.set(layer, clusterMapping);
+                }
+            }
+        }
+
+        this.assertNoOverlappingGidRanges(newTilesets);
+
+        this.remapLayers(this.optimizedMap.layers, layerMappings);
+        this.optimizedMap.tilesets = newTilesets;
+
+        if (this.logLevel) {
+            const duplicated = renderedTileCount - usedTiles.size;
+            console.log(
+                `Tiles optimization has been done: ${newTilesets.length} tileset(s), ${usedTiles.size} unique tiles, ${duplicated} duplicated`
+            );
         }
 
         return this.optimizedMap;
     }
 
-    private async optimizeLayers(layers: ITiledMapLayer[]): Promise<void> {
-        for (let i = 0; i < layers.length; i++) {
-            const layer = layers[i];
+    /**
+     * A regular cluster fits in a single tileset. An oversized cluster (a single layer using more
+     * tiles than the capacity) is split into several tilesets; animation groups are kept whole
+     * within a chunk (frame ids are tileset-local), duplicating frames across chunks if needed.
+     */
+    private splitIntoChunks(cluster: Cluster, tilesetIndex: TilesetIndex): number[][] {
+        const sorted = [...cluster.tiles].sort((a, b) => a - b);
 
-            if (layer.type === "group") {
-                if (!layer.layers) {
-                    continue;
-                }
+        if (!cluster.oversized) {
+            return [sorted];
+        }
 
-                await this.optimizeLayers(layer.layers);
+        const chunks: number[][] = [];
+        let current: number[] = [];
+        let currentSet = new Set<number>();
+        const placed = new Set<number>();
+
+        for (const gid of sorted) {
+            // Closures are transitively closed, so a tile placed as part of a previous group
+            // already sits in the same chunk as its own animation frames.
+            if (placed.has(gid)) {
                 continue;
             }
 
-            if (layer.type !== "tilelayer") {
-                continue;
+            const group = animationGroup(gid, tilesetIndex);
+            let toAdd = group.filter((groupGid) => !currentSet.has(groupGid));
+
+            if (current.length > 0 && current.length + toAdd.length > this.tilesetCapacity) {
+                chunks.push(current);
+                current = [];
+                currentSet = new Set();
+                toAdd = group;
             }
 
-            if (!layer.data) {
-                continue;
-            }
-
-            for (let y = 0; y < layer.data.length; y++) {
-                if (typeof layer.data === "string") {
-                    continue;
-                }
-
-                const tileId = layer.data[y];
-
-                if (tileId === 0) {
-                    continue;
-                }
-
-                await this.checkCurrentTileset();
-
-                const newTileId = await this.optimizeNewTile(Number(tileId));
-
-                layer.data[y] = newTileId;
+            for (const groupGid of toAdd) {
+                current.push(groupGid);
+                currentSet.add(groupGid);
+                placed.add(groupGid);
             }
         }
+
+        if (current.length > 0) {
+            chunks.push(current);
+        }
+
+        return chunks;
     }
 
-    private async optimizeNamedTiles(): Promise<void> {
-        for (const tileset of this.tilesetsBuffers.keys()) {
-            if (!tileset.tiles) {
-                continue;
+    private buildTilesetData(
+        gids: number[],
+        localIds: Map<number, number>,
+        firstgid: number,
+        tilesetNumber: number,
+        tilesetIndex: TilesetIndex
+    ): ITiledMapEmbeddedTileset {
+        // Smallest rectangular power-of-2 texture holding the tiles, as close to square as
+        // possible, width >= height (e.g. 300 tiles -> 512 slots -> 32x16 tiles -> 1024x512px).
+        const slots = slotsFor(gids.length);
+        const exponent = Math.log2(slots);
+        const columns = Math.pow(2, Math.ceil(exponent / 2));
+        const rows = slots / columns;
+
+        const tiles: ITiledMapTile[] = [];
+
+        for (const [localId, gid] of gids.entries()) {
+            const sourceTileset = tilesetIndex.getTileset(gid);
+
+            if (!sourceTileset || sourceTileset.firstgid === undefined) {
+                throw new Error(`No source tileset found for tile ${gid}`);
             }
 
-            if (!tileset.firstgid) {
-                throw new Error(`firstgid property is undefined on ${tileset.name} tileset`);
+            const tileData = tilesetIndex.getTileData(gid);
+            const properties = [...(sourceTileset.properties ?? []), ...(tileData?.properties ?? [])];
+            const newTile: ITiledMapTile = { id: localId };
+
+            if (properties.length > 0) {
+                newTile.properties = properties;
             }
 
-            for (const tile of tileset.tiles) {
-                const tileId = tileset.firstgid + tile.id;
+            if (tileData?.animation) {
+                const sourceFirstgid = sourceTileset.firstgid;
+                newTile.animation = tileData.animation.map((frame) => {
+                    const frameLocalId = localIds.get(sourceFirstgid + frame.tileid);
 
-                if (this.optimizedTiles.has(tileId)) {
-                    continue;
-                }
+                    if (frameLocalId === undefined) {
+                        throw new Error(`Undefined tile in animation for ${sourceFirstgid + frame.tileid}`);
+                    }
 
-                if (!tile.properties) {
-                    continue;
-                }
+                    return {
+                        duration: frame.duration,
+                        tileid: frameLocalId,
+                    };
+                });
+            }
 
-                if (tile.properties.find((property) => property.name === "name")) {
-                    await this.optimizeNewTile(tileId);
-                }
+            if (newTile.properties || newTile.animation) {
+                tiles.push(newTile);
             }
         }
-    }
 
-    private generateNextTileset(): ITiledMapEmbeddedTileset {
-        if (this.logLevel === LogLevel.VERBOSE) {
-            console.log("Generate a new tileset data");
-        }
-
-        const tilesetCount = this.optimizedTilesets.length + 1;
         return {
-            columns: 1,
-            firstgid: this.optimizedTiles.size + 1,
-            image: `${this.tilesetPrefix}-${tilesetCount}${this.tilesetSuffix ? "-" + this.tilesetSuffix : ""}.png`,
-            imageheight: 0,
-            imagewidth: 0,
+            columns: columns,
+            firstgid: firstgid,
+            image: `${this.tilesetPrefix}-${tilesetNumber}${this.tilesetSuffix ? "-" + this.tilesetSuffix : ""}.png`,
+            imageheight: rows * this.tileSize,
+            imagewidth: columns * this.tileSize,
             margin: 0,
-            name: `Chunk ${tilesetCount}`,
+            name: `Chunk ${tilesetNumber}`,
             properties: [],
             spacing: 0,
-            tilecount: 0,
+            // Reserve the full image-grid capacity as GIDs (columns*rows === slots), not just the
+            // used tile count. Phaser derives a tileset's tile count from the image dimensions and
+            // ignores this value, so a smaller tilecount would make consecutive tilesets' GID
+            // ranges overlap and silently drop tiles on classic TilemapLayer rendering.
+            tilecount: columns * rows,
             tileheight: this.tileSize,
             tilewidth: this.tileSize,
-            tiles: [],
+            tiles: tiles,
         };
     }
 
-    private async generateNewTilesetBuffer(size: number): Promise<Buffer> {
-        const newFile = new PNG({
-            width: size,
-            height: size,
-        });
-
-        return await newFile.pack().pipe(sharp()).toBuffer();
-    }
-
-    private async optimizeNewTile(tileId: number): Promise<number> {
+    private async renderTileset(
+        gids: number[],
+        tileset: ITiledMapEmbeddedTileset,
+        tilesetIndex: TilesetIndex
+    ): Promise<void> {
         if (this.logLevel === LogLevel.VERBOSE) {
-            //console.log(`${tileId} tile is optimizing...`);
+            console.log(`Rendering of ${tileset.name} tileset...`);
         }
 
-        let minBitId;
-
-        // 3758096384 = 29 & 30 & 31
-        // 3221225472 = 30 & 31
-        // 2684354560 = 29 & 31
-        // 2147483648 = 31
-        // 1610612736 = 29 & 30
-        // 1073741824 = 30
-        // 536870912 = 29
-
-        const bit29 = Math.pow(2, 29);
-        const bit30 = Math.pow(2, 30);
-        const bit31 = Math.pow(2, 31);
-        const bit32 = Math.pow(2, 32);
-
-        if (tileId < bit29) {
-            minBitId = 0;
-        } else if (tileId < bit30) {
-            minBitId = bit29;
-        } else if (tileId < bit29 + bit30) {
-            minBitId = bit30;
-        } else if (tileId < bit31) {
-            minBitId = bit29 + bit30;
-        } else if (tileId < bit29 + bit31) {
-            minBitId = bit31;
-        } else if (tileId < bit30 + bit31) {
-            minBitId = bit29 + bit31;
-        } else if (tileId < bit29 + bit30 + bit31) {
-            minBitId = bit30 + bit31;
-        } else if (tileId < bit32) {
-            minBitId = bit29 + bit30 + bit31;
-        } else {
-            throw new Error(`Something was wrong with flipped tile id ${tileId}`);
+        if (tileset.imagewidth === undefined || tileset.imageheight === undefined) {
+            throw new Error(`Undefined image size on ${tileset.name} tileset`);
         }
 
-        const unflippedTileId = tileId - minBitId;
+        const tileBuffers = await Promise.all(
+            gids.map((gid) => {
+                const sourceTileset = tilesetIndex.getTileset(gid);
 
-        const existantNewTileId = this.optimizedTiles.get(unflippedTileId)?.global;
-
-        if (existantNewTileId) {
-            return existantNewTileId + minBitId;
-        }
-
-        let oldTileset: ITiledMapEmbeddedTileset | undefined;
-
-        for (const tileset of this.tilesetsBuffers.keys()) {
-            if (!tileset.firstgid) {
-                throw new Error(`firstgid property is undefined on ${tileset.name} tileset`);
-            }
-
-            if (!tileset.tilecount) {
-                throw new Error(`tilecount property is undefined on ${tileset.name} tileset`);
-            }
-
-            if (tileset.firstgid <= unflippedTileId && tileset.firstgid + tileset.tilecount > unflippedTileId) {
-                oldTileset = tileset;
-                break;
-            }
-        }
-
-        if (!oldTileset) {
-            if (this.logLevel) {
-                console.error(`${tileId} undefined! Corrupted layers or undefined in tilesets`);
-                console.error("This tile has been replaced by a empty tile");
-            }
-            return 0;
-        }
-
-        if (!oldTileset.firstgid) {
-            throw new Error(`firstgid property is undefined on ${oldTileset.name} tileset`);
-        }
-
-        const oldFirstgid = oldTileset.firstgid;
-        const oldTileIdInTileset = unflippedTileId - oldFirstgid;
-
-        let tileData: ITiledMapTile | undefined = undefined;
-
-        if (oldTileset.tiles) {
-            tileData = oldTileset.tiles.find((tile) => tile.id === oldTileIdInTileset);
-
-            if (tileData && tileData.animation) {
-                if (tileData.animation.length + this.currentExtractedTiles.length > this.tilesetMaxTileCount) {
-                    for (let i = 1; i < this.tilesetMaxTileCount - this.currentExtractedTiles.length; i++) {
-                        this.optimizedTiles.set(-1, {
-                            global: this.optimizedTiles.size + i,
-                            local: 0,
-                        });
-                    }
-
-                    await this.currentTilesetRendering();
-                }
-            }
-        }
-
-        const newTileId = this.optimizedTiles.size + 1;
-
-        this.optimizedTiles.set(unflippedTileId, {
-            global: newTileId,
-            local: this.currentExtractedTiles.length,
-        });
-
-        let newTileData: ITiledMapTile | undefined = undefined;
-
-        this.currentExtractedTiles.push(this.extractTile(oldTileset, unflippedTileId));
-
-        const newTileIdInTileset = this.currentExtractedTiles.length - 1;
-
-        if (oldTileset.properties) {
-            newTileData = {
-                id: newTileIdInTileset,
-                properties: [...oldTileset.properties],
-            };
-        }
-
-        if (!oldTileset.tiles) {
-            if (newTileData) {
-                this.currentTilesetOptimization.tiles?.push(newTileData);
-            }
-            return newTileId + minBitId;
-        }
-
-        if (!tileData) {
-            if (newTileData) {
-                this.currentTilesetOptimization.tiles?.push(newTileData);
-            }
-            return newTileId + minBitId;
-        }
-
-        if (!newTileData) {
-            newTileData = {
-                id: newTileIdInTileset,
-            };
-            this.currentTilesetOptimization.tiles?.push(newTileData);
-        }
-
-        if (tileData.properties) {
-            newTileData.properties
-                ? newTileData.properties.push(...tileData.properties)
-                : (newTileData.properties = [...tileData.properties]);
-            this.currentTilesetOptimization.tiles?.push(newTileData);
-        }
-
-        if (tileData.animation) {
-            newTileData.animation = [];
-            for (const frame of tileData.animation) {
-                await this.optimizeNewTile(oldFirstgid + frame.tileid);
-                const newTile = this.optimizedTiles.get(oldFirstgid + frame.tileid)?.local;
-                if (newTile === undefined) {
-                    throw new Error(`Undefined tile in animation for ${oldFirstgid + frame.tileid}`);
+                if (!sourceTileset) {
+                    throw new Error(`No source tileset found for tile ${gid}`);
                 }
 
-                newTileData.animation.push({
-                    duration: frame.duration,
-                    tileid: newTile,
-                });
-            }
-        }
-
-        return newTileId + minBitId;
-    }
-
-    private async extractTile(tileset: ITiledMapEmbeddedTileset, tileId: number): Promise<Buffer> {
-        if (!tileset.imagewidth) {
-            throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
-        }
-
-        if (!tileset.firstgid) {
-            throw new Error(`firstgid property is undefined on ${tileset.name} tileset`);
-        }
-
-        const tileSizeSpaced = this.tileSize + (tileset.spacing || 0);
-        const tilesetColumns = Math.floor(
-            (tileset.imagewidth - (tileset.margin || 0) + (tileset.spacing || 0)) / tileSizeSpaced
-        );
-        const tilesetTileId = tileId - tileset.firstgid + 1;
-
-        const estimateLeft = tilesetTileId <= tilesetColumns ? tilesetTileId : tilesetTileId % tilesetColumns;
-        const leftStartPoint =
-            (estimateLeft === 0 ? tilesetColumns : estimateLeft) * tileSizeSpaced -
-            tileSizeSpaced +
-            (tileset.margin || 0);
-        let topStartPoint = tileset.margin || 0;
-        let state = tilesetTileId;
-
-        while (state > tilesetColumns) {
-            state -= tilesetColumns;
-            topStartPoint += tileSizeSpaced;
-        }
-
-        const sharpObject = this.tilesetsBuffers.get(tileset);
-
-        if (!sharpObject) {
-            throw new Error("Undefined sharp object");
-        }
-
-        return await sharpObject
-            .extract({
-                left: leftStartPoint,
-                top: topStartPoint,
-                width: this.tileSize,
-                height: this.tileSize,
+                return this.extractTile(sourceTileset, gid);
             })
-            .toBuffer();
-    }
+        );
 
-    private async checkCurrentTileset(): Promise<void> {
-        if (this.currentExtractedTiles.length < this.tilesetMaxTileCount) {
-            return;
-        }
-        await this.currentTilesetRendering();
-    }
-
-    private async currentTilesetRendering(): Promise<void> {
-        if (this.logLevel) {
-            console.log(`Rendering of ${this.currentTilesetOptimization.name} tileset...`);
-        }
-
-        this.currentTilesetOptimization.tilecount = this.currentExtractedTiles.length;
-        const columnCount = Math.ceil(Math.sqrt(this.currentTilesetOptimization.tilecount));
-        const imageSize = columnCount * this.tileSize;
-        this.currentTilesetOptimization.columns = columnCount;
-        this.currentTilesetOptimization.imagewidth = imageSize;
-        this.currentTilesetOptimization.imageheight = imageSize;
-
-        const tilesetBuffer = await this.generateNewTilesetBuffer(imageSize);
-
-        if (this.logLevel === LogLevel.VERBOSE) {
-            console.log("Empty image generated");
-        }
-
-        const sharpTileset = sharp(tilesetBuffer);
-
-        if (this.logLevel === LogLevel.VERBOSE) {
-            console.log("Loading of all tiles who will be optimized...");
-        }
-
-        const tileBuffers = await Promise.all(this.currentExtractedTiles);
-
-        if (this.logLevel === LogLevel.VERBOSE) {
-            console.log("Tiles loading finished");
-            console.log("Tileset optimized image generating...");
-        }
-
+        const emptyBuffer = await this.generateNewTilesetBuffer(tileset.imagewidth, tileset.imageheight);
         const sharpComposites: sharp.OverlayOptions[] = [];
 
         let x = 0;
         let y = 0;
 
         for (const tileBuffer of tileBuffers) {
-            if (x === imageSize) {
+            if (x === tileset.imagewidth) {
                 y += this.tileSize;
                 x = 0;
             }
@@ -449,21 +359,125 @@ export class Optimizer {
             x += this.tileSize;
         }
 
-        await sharpTileset
-            .composite(sharpComposites)
-            .toFile(`${this.outputPath}/${this.currentTilesetOptimization.image}`);
-
-        this.optimizedTilesets.push(this.currentTilesetOptimization);
+        await sharp(emptyBuffer).composite(sharpComposites).toFile(`${this.outputPath}/${tileset.image}`);
 
         if (this.logLevel === LogLevel.VERBOSE) {
-            console.log("Tileset optimized image generated");
+            console.log(`${tileset.name} tileset has been rendered`);
+        }
+    }
+
+    private async generateNewTilesetBuffer(width: number, height: number): Promise<Buffer> {
+        const newFile = new PNG({
+            width: width,
+            height: height,
+        });
+
+        return await newFile.pack().pipe(sharp()).toBuffer();
+    }
+
+    private async extractTile(tileset: ITiledMapEmbeddedTileset, gid: number): Promise<Buffer> {
+        if (!tileset.imagewidth) {
+            throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
         }
 
-        if (this.logLevel) {
-            console.log("The tileset has been rendered");
+        if (tileset.firstgid === undefined) {
+            throw new Error(`firstgid property is undefined on ${tileset.name} tileset`);
         }
 
-        this.currentTilesetOptimization = this.generateNextTileset();
-        this.currentExtractedTiles = [];
+        const spacing = tileset.spacing ?? 0;
+        const margin = tileset.margin ?? 0;
+        const tileSizeSpaced = this.tileSize + spacing;
+        const columns = Math.floor((tileset.imagewidth - margin + spacing) / tileSizeSpaced);
+        const localId = gid - tileset.firstgid;
+        const left = margin + (localId % columns) * tileSizeSpaced;
+        const top = margin + Math.floor(localId / columns) * tileSizeSpaced;
+
+        const sharpObject = this.tilesetsBuffers.get(tileset);
+
+        if (!sharpObject) {
+            throw new Error("Undefined sharp object");
+        }
+
+        return await sharpObject
+            .extract({
+                left: left,
+                top: top,
+                width: this.tileSize,
+                height: this.tileSize,
+            })
+            .toBuffer();
+    }
+
+    /**
+     * Phaser derives a tileset's tile count from its image dimensions and ignores the JSON
+     * `tilecount`, so a tileset effectively owns `[firstgid, firstgid + columns*rows)`. If two of
+     * those ranges intersect, the last one written wins the overlap and tiles belonging to the
+     * other tileset silently render transparent. The emit loop reserves the full image-grid
+     * capacity per tileset precisely to avoid this; assert the invariant so any regression fails
+     * loudly instead of dropping furniture.
+     */
+    private assertNoOverlappingGidRanges(tilesets: ITiledMapEmbeddedTileset[]): void {
+        const ranges = tilesets
+            .map((tileset) => {
+                const columns = tileset.columns ?? 0;
+                const rows = (tileset.imageheight ?? 0) / this.tileSize;
+                const start = tileset.firstgid ?? 0;
+                return { name: tileset.name, start, end: start + columns * rows };
+            })
+            .sort((a, b) => a.start - b.start);
+
+        for (let i = 1; i < ranges.length; i++) {
+            const prev = ranges[i - 1];
+            const curr = ranges[i];
+            if (curr.start < prev.end) {
+                throw new Error(
+                    `Overlapping tileset GID ranges: "${prev.name}" [${prev.start}, ${prev.end}) intersects "${curr.name}" [${curr.start}, ${curr.end})`
+                );
+            }
+        }
+    }
+
+    private remapLayers(layers: ITiledMapLayer[], layerMappings: Map<ITiledMapLayer, Map<number, number>>): void {
+        for (const layer of layers) {
+            if (layer.type === "group") {
+                if (layer.layers) {
+                    this.remapLayers(layer.layers, layerMappings);
+                }
+                continue;
+            }
+
+            if (layer.type !== "tilelayer" || !layer.data) {
+                continue;
+            }
+
+            if (typeof layer.data === "string") {
+                if (this.logLevel) {
+                    console.warn(
+                        `Layer "${layer.name}" data is string-encoded and cannot be optimized: its tile ids will be broken in the output`
+                    );
+                }
+                continue;
+            }
+
+            const mapping = layerMappings.get(layer);
+
+            for (let i = 0; i < layer.data.length; i++) {
+                const rawGid = Number(layer.data[i]);
+
+                if (rawGid === 0) {
+                    continue;
+                }
+
+                const { gid, flipBits } = stripFlipBits(rawGid);
+                const newGid = mapping?.get(gid);
+
+                if (newGid === undefined) {
+                    layer.data[i] = 0;
+                    continue;
+                }
+
+                layer.data[i] = applyFlipBits(newGid, flipBits);
+            }
+        }
     }
 }

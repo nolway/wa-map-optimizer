@@ -8,6 +8,18 @@ export enum LogLevel {
 
 const isLogLevel = z.nativeEnum(LogLevel);
 
+const isPowerOfTwo = (value: number) => Number.isInteger(value) && value > 0 && (value & (value - 1)) === 0;
+
+/**
+ * Maximum size (in pixels) of an output tileset texture. Must be a power of 2 so the generated
+ * textures are GPU-friendly. Defaults to 4096.
+ */
+const isTilesetMaxSize = z
+    .number()
+    .gte(32)
+    .refine(isPowerOfTwo, { message: "Tileset size must be a power of 2" })
+    .optional();
+
 const isOptimizeBufferOptions = z.object({
     tile: z
         .object({
@@ -21,7 +33,7 @@ const isOptimizeBufferOptions = z.object({
                 .object({
                     prefix: z.string().optional(),
                     suffix: z.string().optional(),
-                    size: z.number().gte(32).multipleOf(8).optional(),
+                    size: isTilesetMaxSize,
                 })
                 .optional(),
         })
@@ -43,7 +55,7 @@ const isOptimizeOptions = isOptimizeBufferOptions.extend({
                 .object({
                     prefix: z.string().optional(),
                     suffix: z.string().optional(),
-                    size: z.number().gte(32).multipleOf(8).optional(),
+                    size: isTilesetMaxSize,
                     compress: z
                         .object({
                             quality: z.tuple([z.number().gte(0).lte(1), z.number().gte(0).lte(1)]).optional(),
