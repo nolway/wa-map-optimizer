@@ -4,7 +4,6 @@ import {
     ITiledMapLayer,
     ITiledMapTile,
 } from "@workadventure/tiled-map-type-guard";
-import { PNG } from "pngjs";
 import sharp, { Sharp } from "sharp";
 import { Cluster, clusterLayers, slotsFor } from "./Clustering.js";
 import {
@@ -41,6 +40,9 @@ export class Optimizer {
     private tilesetPrefix: string;
     private tilesetSuffix?: string;
     private logLevel: LogLevel;
+    // Each source tileset decoded to raw RGBA pixels exactly once. Tiles are then sliced out of
+    // these buffers with plain memory copies instead of a per-tile sharp/libvips extract() call.
+    private readonly sourceRaws = new Map<ITiledMapEmbeddedTileset, { data: Buffer; width: number; height: number }>();
 
     constructor(
         map: ITiledMap,
@@ -133,6 +135,8 @@ export class Optimizer {
         }
 
         // Pass 3: rendering & remapping
+        await this.loadSourceRaws();
+
         const layerMappings = new Map<ITiledMapLayer, Map<number, number>>();
         const newTilesets: ITiledMapEmbeddedTileset[] = [];
         let firstgid = 1;
@@ -326,56 +330,124 @@ export class Optimizer {
             throw new Error(`Undefined image size on ${tileset.name} tileset`);
         }
 
-        const tileBuffers = await Promise.all(
-            gids.map((gid) => {
-                const sourceTileset = tilesetIndex.getTileset(gid);
-
-                if (!sourceTileset) {
-                    throw new Error(`No source tileset found for tile ${gid}`);
-                }
-
-                return this.extractTile(sourceTileset, gid);
-            })
-        );
-
-        const emptyBuffer = await this.generateNewTilesetBuffer(tileset.imagewidth, tileset.imageheight);
-        const sharpComposites: sharp.OverlayOptions[] = [];
+        // The tiles form a regular, non-overlapping grid on a transparent canvas, so "compositing"
+        // them is really just placing each tile's pixels into its own cell — a memory copy. Handing
+        // thousands of tiles to sharp/libvips composite() instead makes it run its general N-layer
+        // alpha compositor, whose cost scales with the number of layers (per-tile bookkeeping), not
+        // the pixels moved. Likewise, extracting each tile with a per-tile sharp extract() call is
+        // thousands of round-trips into libvips over source pixels we already hold in memory. We
+        // copy each tile's rows straight from the cached source buffer into the destination buffer
+        // and let sharp encode the finished image exactly once.
+        const channels = 4;
+        const width = tileset.imagewidth;
+        const height = tileset.imageheight;
+        const dest = Buffer.alloc(width * height * channels); // zero-filled == fully transparent
 
         let x = 0;
         let y = 0;
 
-        for (const tileBuffer of tileBuffers) {
-            if (x === tileset.imagewidth) {
+        for (const gid of gids) {
+            if (x === width) {
                 y += this.tileSize;
                 x = 0;
             }
 
-            sharpComposites.push({
-                input: tileBuffer,
-                top: y,
-                left: x,
-            });
+            const sourceTileset = tilesetIndex.getTileset(gid);
+            if (!sourceTileset) {
+                throw new Error(`No source tileset found for tile ${gid}`);
+            }
+
+            const source = this.sourceRaws.get(sourceTileset);
+            if (!source) {
+                throw new Error(`No decoded source pixels for tileset ${sourceTileset.name}`);
+            }
+
+            const { left, top } = this.tileLocation(sourceTileset, gid);
+
+            // sharp's extract() used to throw on an out-of-range crop; Buffer.copy() would instead
+            // silently truncate and emit a corrupt tile. Keep the loud failure for bad metadata.
+            if (left < 0 || top < 0 || left + this.tileSize > source.width || top + this.tileSize > source.height) {
+                throw new Error(
+                    `Tile ${gid} maps to an out-of-bounds source rect [${left},${top} +${this.tileSize}] in the ${source.width}x${source.height} tileset ${sourceTileset.name}`
+                );
+            }
+
+            this.blitTile(source, left, top, dest, width, x, y);
 
             x += this.tileSize;
         }
 
-        await sharp(emptyBuffer).composite(sharpComposites).toFile(`${this.outputPath}/${tileset.image}`);
+        await sharp(dest, { raw: { width, height, channels } }).png().toFile(`${this.outputPath}/${tileset.image}`);
 
         if (this.logLevel === LogLevel.VERBOSE) {
             console.log(`${tileset.name} tileset has been rendered`);
         }
     }
 
-    private async generateNewTilesetBuffer(width: number, height: number): Promise<Buffer> {
-        const newFile = new PNG({
-            width: width,
-            height: height,
-        });
+    /**
+     * Copy one tileSize×tileSize RGBA tile from a source image buffer into a destination image
+     * buffer, row by row. This is a straight memory copy, not an alpha composite: output tiles sit
+     * on a non-overlapping grid over a transparent canvas, so each destination cell is written
+     * exactly once and there is nothing to blend against. See renderTileset for why that matters.
+     */
+    private blitTile(
+        source: { data: Buffer; width: number },
+        srcLeft: number,
+        srcTop: number,
+        dest: Buffer,
+        destWidth: number,
+        destLeft: number,
+        destTop: number
+    ): void {
+        const channels = 4;
+        const rowBytes = this.tileSize * channels;
+        const srcStride = source.width * channels;
+        const destStride = destWidth * channels;
 
-        return await newFile.pack().pipe(sharp()).toBuffer();
+        for (let row = 0; row < this.tileSize; row++) {
+            const srcStart = (srcTop + row) * srcStride + srcLeft * channels;
+            const destStart = (destTop + row) * destStride + destLeft * channels;
+            source.data.copy(dest, destStart, srcStart, srcStart + rowBytes);
+        }
     }
 
-    private async extractTile(tileset: ITiledMapEmbeddedTileset, gid: number): Promise<Buffer> {
+    /**
+     * Decode every source tileset image to raw RGBA pixels exactly once and cache it. ensureAlpha()
+     * forces a uniform 4-channel layout (opaque alpha for RGB sources) so tiles can be sliced with a
+     * single fixed stride, and matches the transparent-over-RGBA canvas the tiles are drawn onto.
+     */
+    private async loadSourceRaws(): Promise<void> {
+        for (const [tileset, sharpObject] of this.tilesetsBuffers) {
+            const { data, info } = await sharpObject.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+
+            // The render loop assumes a fixed 4-channel (RGBA) stride; ensureAlpha() guarantees it
+            // for RGB/RGBA sources but not e.g. a grayscale image (which yields 2 channels).
+            if (info.channels !== 4) {
+                throw new Error(
+                    `Tileset ${tileset.name} decoded to ${info.channels} channels after ensureAlpha(), expected 4 (RGBA). Is it a grayscale image?`
+                );
+            }
+
+            // tileLocation() derives tile columns from the metadata width, while the copy loop uses
+            // the decoded width for its stride. If they disagree, tiles would be read from the wrong
+            // offsets — silently, since the reads could still land in bounds. Fail loudly instead.
+            if (tileset.imagewidth !== info.width || tileset.imageheight !== info.height) {
+                throw new Error(
+                    `Tileset ${tileset.name} metadata size ${tileset.imagewidth ?? "?"}x${
+                        tileset.imageheight ?? "?"
+                    } does not match the decoded image ${info.width}x${info.height}`
+                );
+            }
+
+            this.sourceRaws.set(tileset, { data, width: info.width, height: info.height });
+        }
+    }
+
+    /**
+     * Pixel coordinates of a tile's top-left corner within its source image, honouring the source
+     * tileset's margin and inter-tile spacing.
+     */
+    private tileLocation(tileset: ITiledMapEmbeddedTileset, gid: number): { left: number; top: number } {
         if (!tileset.imagewidth) {
             throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
         }
@@ -392,20 +464,7 @@ export class Optimizer {
         const left = margin + (localId % columns) * tileSizeSpaced;
         const top = margin + Math.floor(localId / columns) * tileSizeSpaced;
 
-        const sharpObject = this.tilesetsBuffers.get(tileset);
-
-        if (!sharpObject) {
-            throw new Error("Undefined sharp object");
-        }
-
-        return await sharpObject
-            .extract({
-                left: left,
-                top: top,
-                width: this.tileSize,
-                height: this.tileSize,
-            })
-            .toBuffer();
+        return { left, top };
     }
 
     /**
