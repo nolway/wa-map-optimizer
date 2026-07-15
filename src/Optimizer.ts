@@ -4,7 +4,6 @@ import {
     ITiledMapLayer,
     ITiledMapTile,
 } from "@workadventure/tiled-map-type-guard";
-import { PNG } from "pngjs";
 import sharp, { Sharp } from "sharp";
 import { Cluster, clusterLayers, slotsFor } from "./Clustering.js";
 import {
@@ -338,52 +337,45 @@ export class Optimizer {
             })
         );
 
-        const emptyBuffer = await this.generateNewTilesetBuffer(tileset.imagewidth, tileset.imageheight);
-        const sharpComposites: sharp.OverlayOptions[] = [];
+        // The tiles form a regular, non-overlapping grid on a transparent canvas, so "compositing"
+        // them is really just placing each tile's pixels into its own cell — a memory copy. Handing
+        // thousands of tiles to sharp/libvips composite() instead makes it run its general N-layer
+        // alpha compositor, whose cost scales with the number of layers (per-tile bookkeeping), not
+        // the pixels moved — the dominant cost on large maps. We assemble the raw RGBA buffer here
+        // with plain row copies and let sharp encode the finished image exactly once.
+        const channels = 4;
+        const width = tileset.imagewidth;
+        const height = tileset.imageheight;
+        const rowBytes = this.tileSize * channels;
+        const destStride = width * channels;
+        const dest = Buffer.alloc(width * height * channels); // zero-filled == fully transparent
 
         let x = 0;
         let y = 0;
 
         for (const tileBuffer of tileBuffers) {
-            if (x === tileset.imagewidth) {
+            if (x === width) {
                 y += this.tileSize;
                 x = 0;
             }
 
-            sharpComposites.push({
-                input: tileBuffer.buffer,
-                raw: {
-                    width: this.tileSize,
-                    height: this.tileSize,
-                    channels: tileBuffer.channels,
-                },
-                top: y,
-                left: x,
-            });
+            for (let row = 0; row < this.tileSize; row++) {
+                const srcStart = row * rowBytes;
+                const destStart = (y + row) * destStride + x * channels;
+                tileBuffer.copy(dest, destStart, srcStart, srcStart + rowBytes);
+            }
 
             x += this.tileSize;
         }
 
-        await sharp(emptyBuffer).composite(sharpComposites).toFile(`${this.outputPath}/${tileset.image}`);
+        await sharp(dest, { raw: { width, height, channels } }).png().toFile(`${this.outputPath}/${tileset.image}`);
 
         if (this.logLevel === LogLevel.VERBOSE) {
             console.log(`${tileset.name} tileset has been rendered`);
         }
     }
 
-    private async generateNewTilesetBuffer(width: number, height: number): Promise<Buffer> {
-        const newFile = new PNG({
-            width: width,
-            height: height,
-        });
-
-        return await newFile.pack().pipe(sharp()).toBuffer();
-    }
-
-    private async extractTile(
-        tileset: ITiledMapEmbeddedTileset,
-        gid: number
-    ): Promise<{ buffer: Buffer; channels: 1 | 2 | 3 | 4 }> {
+    private async extractTile(tileset: ITiledMapEmbeddedTileset, gid: number): Promise<Buffer> {
         if (!tileset.imagewidth) {
             throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
         }
@@ -406,20 +398,20 @@ export class Optimizer {
             throw new Error("Undefined sharp object");
         }
 
-        // Return raw (already-decoded) pixels instead of a PNG. The source is held in memory as a
-        // raw buffer, so encoding each 32x32 tile to PNG here only to have composite() decode it
-        // again is pure overhead. Raw buffers let composite() blend them directly.
-        const { data, info } = await sharpObject
+        // Return raw (already-decoded) RGBA pixels. The source is held in memory as a raw buffer, so
+        // encoding each 32x32 tile to PNG here would be pure overhead. ensureAlpha() forces a uniform
+        // 4-channel layout (opaque alpha for RGB sources) so renderTileset can copy every tile's rows
+        // into the destination buffer with a single fixed stride.
+        return await sharpObject
             .extract({
                 left: left,
                 top: top,
                 width: this.tileSize,
                 height: this.tileSize,
             })
+            .ensureAlpha()
             .raw()
-            .toBuffer({ resolveWithObject: true });
-
-        return { buffer: data, channels: info.channels };
+            .toBuffer();
     }
 
     /**
