@@ -40,6 +40,9 @@ export class Optimizer {
     private tilesetPrefix: string;
     private tilesetSuffix?: string;
     private logLevel: LogLevel;
+    // Each source tileset decoded to raw RGBA pixels exactly once. Tiles are then sliced out of
+    // these buffers with plain memory copies instead of a per-tile sharp/libvips extract() call.
+    private readonly sourceRaws = new Map<ITiledMapEmbeddedTileset, { data: Buffer; width: number }>();
 
     constructor(
         map: ITiledMap,
@@ -132,6 +135,8 @@ export class Optimizer {
         }
 
         // Pass 3: rendering & remapping
+        await this.loadSourceRaws();
+
         const layerMappings = new Map<ITiledMapLayer, Map<number, number>>();
         const newTilesets: ITiledMapEmbeddedTileset[] = [];
         let firstgid = 1;
@@ -325,24 +330,14 @@ export class Optimizer {
             throw new Error(`Undefined image size on ${tileset.name} tileset`);
         }
 
-        const tileBuffers = await Promise.all(
-            gids.map((gid) => {
-                const sourceTileset = tilesetIndex.getTileset(gid);
-
-                if (!sourceTileset) {
-                    throw new Error(`No source tileset found for tile ${gid}`);
-                }
-
-                return this.extractTile(sourceTileset, gid);
-            })
-        );
-
         // The tiles form a regular, non-overlapping grid on a transparent canvas, so "compositing"
         // them is really just placing each tile's pixels into its own cell — a memory copy. Handing
         // thousands of tiles to sharp/libvips composite() instead makes it run its general N-layer
         // alpha compositor, whose cost scales with the number of layers (per-tile bookkeeping), not
-        // the pixels moved — the dominant cost on large maps. We assemble the raw RGBA buffer here
-        // with plain row copies and let sharp encode the finished image exactly once.
+        // the pixels moved. Likewise, extracting each tile with a per-tile sharp extract() call is
+        // thousands of round-trips into libvips over source pixels we already hold in memory. We
+        // copy each tile's rows straight from the cached source buffer into the destination buffer
+        // and let sharp encode the finished image exactly once.
         const channels = 4;
         const width = tileset.imagewidth;
         const height = tileset.imageheight;
@@ -353,16 +348,29 @@ export class Optimizer {
         let x = 0;
         let y = 0;
 
-        for (const tileBuffer of tileBuffers) {
+        for (const gid of gids) {
             if (x === width) {
                 y += this.tileSize;
                 x = 0;
             }
 
+            const sourceTileset = tilesetIndex.getTileset(gid);
+            if (!sourceTileset) {
+                throw new Error(`No source tileset found for tile ${gid}`);
+            }
+
+            const source = this.sourceRaws.get(sourceTileset);
+            if (!source) {
+                throw new Error(`No decoded source pixels for tileset ${sourceTileset.name}`);
+            }
+
+            const { left, top } = this.tileLocation(sourceTileset, gid);
+            const srcStride = source.width * channels;
+
             for (let row = 0; row < this.tileSize; row++) {
-                const srcStart = row * rowBytes;
+                const srcStart = (top + row) * srcStride + left * channels;
                 const destStart = (y + row) * destStride + x * channels;
-                tileBuffer.copy(dest, destStart, srcStart, srcStart + rowBytes);
+                source.data.copy(dest, destStart, srcStart, srcStart + rowBytes);
             }
 
             x += this.tileSize;
@@ -375,7 +383,23 @@ export class Optimizer {
         }
     }
 
-    private async extractTile(tileset: ITiledMapEmbeddedTileset, gid: number): Promise<Buffer> {
+    /**
+     * Decode every source tileset image to raw RGBA pixels exactly once and cache it. ensureAlpha()
+     * forces a uniform 4-channel layout (opaque alpha for RGB sources) so tiles can be sliced with a
+     * single fixed stride, and matches the transparent-over-RGBA canvas the tiles are drawn onto.
+     */
+    private async loadSourceRaws(): Promise<void> {
+        for (const [tileset, sharpObject] of this.tilesetsBuffers) {
+            const { data, info } = await sharpObject.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+            this.sourceRaws.set(tileset, { data, width: info.width });
+        }
+    }
+
+    /**
+     * Pixel coordinates of a tile's top-left corner within its source image, honouring the source
+     * tileset's margin and inter-tile spacing.
+     */
+    private tileLocation(tileset: ITiledMapEmbeddedTileset, gid: number): { left: number; top: number } {
         if (!tileset.imagewidth) {
             throw new Error(`imagewidth property is undefined on ${tileset.name} tileset`);
         }
@@ -392,26 +416,7 @@ export class Optimizer {
         const left = margin + (localId % columns) * tileSizeSpaced;
         const top = margin + Math.floor(localId / columns) * tileSizeSpaced;
 
-        const sharpObject = this.tilesetsBuffers.get(tileset);
-
-        if (!sharpObject) {
-            throw new Error("Undefined sharp object");
-        }
-
-        // Return raw (already-decoded) RGBA pixels. The source is held in memory as a raw buffer, so
-        // encoding each 32x32 tile to PNG here would be pure overhead. ensureAlpha() forces a uniform
-        // 4-channel layout (opaque alpha for RGB sources) so renderTileset can copy every tile's rows
-        // into the destination buffer with a single fixed stride.
-        return await sharpObject
-            .extract({
-                left: left,
-                top: top,
-                width: this.tileSize,
-                height: this.tileSize,
-            })
-            .ensureAlpha()
-            .raw()
-            .toBuffer();
+        return { left, top };
     }
 
     /**
