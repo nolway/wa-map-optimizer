@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/nolway/wa-map-optimizer/compare/v2.0.0...v2.0.1) (2026-07-15)
+
+
+### Bug Fixes
+
+* Fixing CI deploy ([d89b030](https://github.com/nolway/wa-map-optimizer/commit/d89b03059487118528c88267b565d294c80438dc))
+
 ## [2.0.0](https://github.com/nolway/wa-map-optimizer/compare/v1.4.8...v2.0.0) (2026-07-15)
 
 
