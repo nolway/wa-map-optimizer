@@ -20,20 +20,25 @@ jobs:
                 release-type: node
                 package-name: "wa-map-optimizer"
             # The logic below handles the npm publication:
-            - uses: actions/checkout@v2
+            - uses: actions/checkout@v7
                 # these if statements ensure that a publication only occurs when
                 # a new release is created:
               if: ${{ steps.release.outputs.release_created }}
-            - uses: actions/setup-node@v1
+            - uses: actions/setup-node@v4
               with:
-                node-version: 20
+                node-version: 24
                 registry-url: 'https://registry.npmjs.org'
+              if: ${{ steps.release.outputs.release_created }}
+            # Trusted publishing (OIDC) requires npm >= 11.5.1, newer than the
+            # version bundled with the runner.
+            - run: npm install -g npm@latest
               if: ${{ steps.release.outputs.release_created }}
             - run: npm ci
               if: ${{ steps.release.outputs.release_created }}
             - run: npm run build
               if: ${{ steps.release.outputs.release_created }}
-            - run: npm publish --access public
-              env:
-                NODE_AUTH_TOKEN: ""
+            # No NODE_AUTH_TOKEN: authentication happens via OIDC, backed by the
+            # `id-token: write` permission and the trusted publisher configured
+            # for this package on npmjs.com.
+            - run: npm publish --provenance --access public
               if: ${{ steps.release.outputs.release_created }}
