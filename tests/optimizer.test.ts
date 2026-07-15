@@ -44,6 +44,53 @@ function sourceTileset(columns: number, rows: number): { tileset: ITiledMapEmbed
     return { tileset, buffer };
 }
 
+type Rgba = [number, number, number, number];
+
+/**
+ * A source tileset whose tiles are each filled with a distinct solid RGBA colour, laid out
+ * left-to-right, top-to-bottom. Unlike `sourceTileset`, pixels matter here: the rendering test
+ * decodes the optimized output and asserts each tile landed at the right position with its colour
+ * and alpha intact.
+ */
+function coloredSource(colors: Rgba[], columns: number): { tileset: ITiledMapEmbeddedTileset; buffer: sharp.Sharp } {
+    const rows = Math.ceil(colors.length / columns);
+    const width = columns * TILE;
+    const height = rows * TILE;
+    const raw = Buffer.alloc(width * height * 4, 0);
+
+    colors.forEach((color, i) => {
+        const originX = (i % columns) * TILE;
+        const originY = Math.floor(i / columns) * TILE;
+        for (let py = 0; py < TILE; py++) {
+            for (let px = 0; px < TILE; px++) {
+                const offset = ((originY + py) * width + (originX + px)) * 4;
+                raw[offset] = color[0];
+                raw[offset + 1] = color[1];
+                raw[offset + 2] = color[2];
+                raw[offset + 3] = color[3];
+            }
+        }
+    });
+
+    const buffer = sharp(raw, { raw: { width, height, channels: 4 } }).png();
+
+    const tileset = {
+        columns,
+        firstgid: 1,
+        image: "source.png",
+        imageheight: height,
+        imagewidth: width,
+        margin: 0,
+        name: "source",
+        spacing: 0,
+        tilecount: colors.length,
+        tileheight: TILE,
+        tilewidth: TILE,
+    } as ITiledMapEmbeddedTileset;
+
+    return { tileset, buffer };
+}
+
 function tileLayer(name: string, gids: number[]): ITiledMapLayer {
     return {
         type: "tilelayer",
@@ -150,5 +197,54 @@ describe("Optimizer GID ranges", () => {
         for (let i = 1; i < sorted.length; i++) {
             expect(sorted[i].firstgid).toBe((sorted[i - 1].firstgid ?? 0) + capacity(sorted[i - 1]));
         }
+    });
+});
+
+describe("Optimizer pixel rendering", () => {
+    it("places each tile's pixels and alpha at the correct position in the output image", async () => {
+        // Four distinct tiles. The last is semi-transparent: the raw-copy pipeline must preserve its
+        // colour and alpha exactly (no premultiplication), and drop it at the right cell.
+        const colors: Rgba[] = [
+            [255, 0, 0, 255], // gid 1
+            [0, 255, 0, 255], // gid 2
+            [0, 0, 255, 255], // gid 3
+            [10, 20, 30, 128], // gid 4 (semi-transparent)
+        ];
+        const source = coloredSource(colors, 2);
+
+        const map = {
+            layers: [tileLayer("floor", [1, 2, 3, 4])],
+            tilesets: [source.tileset],
+        } as unknown as ITiledMap;
+        const buffers = new Map<ITiledMapEmbeddedTileset, sharp.Sharp>([[source.tileset, source.buffer]]);
+
+        const outputPath = fs.mkdtempSync(path.join(os.tmpdir(), "wa-opt-"));
+        tmpDirs.push(outputPath);
+
+        const optimizer = new Optimizer(
+            map,
+            buffers,
+            { tile: { size: TILE }, logs: 0, output: { tileset: { size: 64 } } },
+            outputPath
+        );
+        const result = await optimizer.optimize();
+
+        expect(result.tilesets).toHaveLength(1);
+        const image = result.tilesets[0] as ITiledMapEmbeddedTileset;
+        const outColumns = image.columns ?? 0;
+
+        const { data, info } = await sharp(path.join(outputPath, image.image as string))
+            .ensureAlpha()
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+
+        // Tiles are emitted in sorted-gid order, so local id i corresponds to gid i+1 (colors[i]) and
+        // sits at grid cell (i % columns, i / columns). Sample the centre of each cell.
+        colors.forEach((color, i) => {
+            const px = (i % outColumns) * TILE + Math.floor(TILE / 2);
+            const py = Math.floor(i / outColumns) * TILE + Math.floor(TILE / 2);
+            const offset = (py * info.width + px) * 4;
+            expect([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]).toEqual(color);
+        });
     });
 });

@@ -42,7 +42,7 @@ export class Optimizer {
     private logLevel: LogLevel;
     // Each source tileset decoded to raw RGBA pixels exactly once. Tiles are then sliced out of
     // these buffers with plain memory copies instead of a per-tile sharp/libvips extract() call.
-    private readonly sourceRaws = new Map<ITiledMapEmbeddedTileset, { data: Buffer; width: number }>();
+    private readonly sourceRaws = new Map<ITiledMapEmbeddedTileset, { data: Buffer; width: number; height: number }>();
 
     constructor(
         map: ITiledMap,
@@ -365,6 +365,15 @@ export class Optimizer {
             }
 
             const { left, top } = this.tileLocation(sourceTileset, gid);
+
+            // sharp's extract() used to throw on an out-of-range crop; Buffer.copy() would instead
+            // silently truncate and emit a corrupt tile. Keep the loud failure for bad metadata.
+            if (left < 0 || top < 0 || left + this.tileSize > source.width || top + this.tileSize > source.height) {
+                throw new Error(
+                    `Tile ${gid} maps to an out-of-bounds source rect [${left},${top} +${this.tileSize}] in the ${source.width}x${source.height} tileset ${sourceTileset.name}`
+                );
+            }
+
             const srcStride = source.width * channels;
 
             for (let row = 0; row < this.tileSize; row++) {
@@ -391,7 +400,27 @@ export class Optimizer {
     private async loadSourceRaws(): Promise<void> {
         for (const [tileset, sharpObject] of this.tilesetsBuffers) {
             const { data, info } = await sharpObject.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-            this.sourceRaws.set(tileset, { data, width: info.width });
+
+            // The render loop assumes a fixed 4-channel (RGBA) stride; ensureAlpha() guarantees it
+            // for RGB/RGBA sources but not e.g. a grayscale image (which yields 2 channels).
+            if (info.channels !== 4) {
+                throw new Error(
+                    `Tileset ${tileset.name} decoded to ${info.channels} channels after ensureAlpha(), expected 4 (RGBA). Is it a grayscale image?`
+                );
+            }
+
+            // tileLocation() derives tile columns from the metadata width, while the copy loop uses
+            // the decoded width for its stride. If they disagree, tiles would be read from the wrong
+            // offsets — silently, since the reads could still land in bounds. Fail loudly instead.
+            if (tileset.imagewidth !== info.width || tileset.imageheight !== info.height) {
+                throw new Error(
+                    `Tileset ${tileset.name} metadata size ${tileset.imagewidth ?? "?"}x${
+                        tileset.imageheight ?? "?"
+                    } does not match the decoded image ${info.width}x${info.height}`
+                );
+            }
+
+            this.sourceRaws.set(tileset, { data, width: info.width, height: info.height });
         }
     }
 
