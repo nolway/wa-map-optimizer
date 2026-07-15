@@ -163,7 +163,9 @@ export class Optimizer {
                     );
                 }
 
-                firstgid += gids.length;
+                // Advance by the full image-grid capacity so the reserved GID range matches the
+                // image dimensions Phaser reads. renderedTileCount still counts real tiles.
+                firstgid += slotsFor(gids.length);
                 renderedTileCount += gids.length;
             }
 
@@ -174,6 +176,8 @@ export class Optimizer {
                 }
             }
         }
+
+        this.assertNoOverlappingGidRanges(newTilesets);
 
         this.remapLayers(this.optimizedMap.layers, layerMappings);
         this.optimizedMap.tilesets = newTilesets;
@@ -298,7 +302,11 @@ export class Optimizer {
             name: `Chunk ${tilesetNumber}`,
             properties: [],
             spacing: 0,
-            tilecount: gids.length,
+            // Reserve the full image-grid capacity as GIDs (columns*rows === slots), not just the
+            // used tile count. Phaser derives a tileset's tile count from the image dimensions and
+            // ignores this value, so a smaller tilecount would make consecutive tilesets' GID
+            // ranges overlap and silently drop tiles on classic TilemapLayer rendering.
+            tilecount: columns * rows,
             tileheight: this.tileSize,
             tilewidth: this.tileSize,
             tiles: tiles,
@@ -398,6 +406,35 @@ export class Optimizer {
                 height: this.tileSize,
             })
             .toBuffer();
+    }
+
+    /**
+     * Phaser derives a tileset's tile count from its image dimensions and ignores the JSON
+     * `tilecount`, so a tileset effectively owns `[firstgid, firstgid + columns*rows)`. If two of
+     * those ranges intersect, the last one written wins the overlap and tiles belonging to the
+     * other tileset silently render transparent. The emit loop reserves the full image-grid
+     * capacity per tileset precisely to avoid this; assert the invariant so any regression fails
+     * loudly instead of dropping furniture.
+     */
+    private assertNoOverlappingGidRanges(tilesets: ITiledMapEmbeddedTileset[]): void {
+        const ranges = tilesets
+            .map((tileset) => {
+                const columns = tileset.columns ?? 0;
+                const rows = (tileset.imageheight ?? 0) / this.tileSize;
+                const start = tileset.firstgid ?? 0;
+                return { name: tileset.name, start, end: start + columns * rows };
+            })
+            .sort((a, b) => a.start - b.start);
+
+        for (let i = 1; i < ranges.length; i++) {
+            const prev = ranges[i - 1];
+            const curr = ranges[i];
+            if (curr.start < prev.end) {
+                throw new Error(
+                    `Overlapping tileset GID ranges: "${prev.name}" [${prev.start}, ${prev.end}) intersects "${curr.name}" [${curr.start}, ${curr.end})`
+                );
+            }
+        }
     }
 
     private remapLayers(layers: ITiledMapLayer[], layerMappings: Map<ITiledMapLayer, Map<number, number>>): void {
