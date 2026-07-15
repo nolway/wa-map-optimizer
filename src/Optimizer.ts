@@ -341,8 +341,6 @@ export class Optimizer {
         const channels = 4;
         const width = tileset.imagewidth;
         const height = tileset.imageheight;
-        const rowBytes = this.tileSize * channels;
-        const destStride = width * channels;
         const dest = Buffer.alloc(width * height * channels); // zero-filled == fully transparent
 
         let x = 0;
@@ -374,13 +372,7 @@ export class Optimizer {
                 );
             }
 
-            const srcStride = source.width * channels;
-
-            for (let row = 0; row < this.tileSize; row++) {
-                const srcStart = (top + row) * srcStride + left * channels;
-                const destStart = (y + row) * destStride + x * channels;
-                source.data.copy(dest, destStart, srcStart, srcStart + rowBytes);
-            }
+            this.blitTile(source, left, top, dest, width, x, y);
 
             x += this.tileSize;
         }
@@ -389,6 +381,33 @@ export class Optimizer {
 
         if (this.logLevel === LogLevel.VERBOSE) {
             console.log(`${tileset.name} tileset has been rendered`);
+        }
+    }
+
+    /**
+     * Copy one tileSize×tileSize RGBA tile from a source image buffer into a destination image
+     * buffer, row by row. This is a straight memory copy, not an alpha composite: output tiles sit
+     * on a non-overlapping grid over a transparent canvas, so each destination cell is written
+     * exactly once and there is nothing to blend against. See renderTileset for why that matters.
+     */
+    private blitTile(
+        source: { data: Buffer; width: number },
+        srcLeft: number,
+        srcTop: number,
+        dest: Buffer,
+        destWidth: number,
+        destLeft: number,
+        destTop: number
+    ): void {
+        const channels = 4;
+        const rowBytes = this.tileSize * channels;
+        const srcStride = source.width * channels;
+        const destStride = destWidth * channels;
+
+        for (let row = 0; row < this.tileSize; row++) {
+            const srcStart = (srcTop + row) * srcStride + srcLeft * channels;
+            const destStart = (destTop + row) * destStride + destLeft * channels;
+            source.data.copy(dest, destStart, srcStart, srcStart + rowBytes);
         }
     }
 
