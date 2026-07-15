@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.0.0](https://github.com/nolway/wa-map-optimizer/compare/v1.4.8...v2.0.0) (2026-07-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* output.tileset.size now means the maximum texture size (must be a power of 2, default 4096) instead of the fixed 512px chunk size, and output tilesets are laid out per layer cluster rather than as sequential fixed-size chunks.
+
+### Features
+
+* guarantee one tileset per layer for Phaser 4 TilemapGPULayer ([#18](https://github.com/nolway/wa-map-optimizer/issues/18)) ([fb01ec0](https://github.com/nolway/wa-map-optimizer/commit/fb01ec0f557d54829c5dfc7a7fdfe5bd6b4cbd5d))
+* use OIDC npm connection ([3b101e0](https://github.com/nolway/wa-map-optimizer/commit/3b101e0614b9ecf96c5277c801a49c285c4e9f37))
+
+
+### Performance Improvements
+
+* speed up tileset rendering ~19x (raw pixel pipeline) ([#19](https://github.com/nolway/wa-map-optimizer/issues/19)) ([8272ee0](https://github.com/nolway/wa-map-optimizer/commit/8272ee0f6501caec715cd597b2997fc6c1d0aaec))
+
 ## [1.4.8](https://github.com/Nolway/wa-map-optimizer/compare/v1.4.7...v1.4.8) (2024-06-19)
 
 
