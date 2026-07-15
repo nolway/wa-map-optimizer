@@ -114,7 +114,6 @@ Rules:
 - **Tileset images can optionally be compressed** with pngquant (via the `output.tileset.compress`
   option) to further shrink the output.
 
-
 ## Author
 
 👤 **Nolway (Alexis Faizeau)**
